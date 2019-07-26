@@ -1,0 +1,100 @@
+Analysis Server 2005 Backup Powershell Script
+
+This PowerShell script will connect to an SSAS instance, enumerate ALL databases, and back each one up. You can then add this to either as a Scheduled Task or as a SQL Agent job. 
+
+
+
+
+# SQL Server 2005 Analysis Server Archive
+#
+# Ron Klimaszewski
+#
+# This script will connect to a SSAS instance and back up all 
+# of the databases to a folder specified by the -Destination
+# flag.  If this flag is not used, it will default to the SSAS
+# parameter 'BackupDir' to write the files.
+#
+# Example: 
+# rKiveAS.ps1 -ServerInstance <server\inst> -Destination <drive:\x\y | \\unc\path> -RetentionDays nn 
+#         -Destination defaults to the BackupDir setting 
+# 
+# Set-ExecutionPolicy unrestricted 
+
+param ( 
+    [string]$ServerInstance = $(Throw "A -ServerInstance parameter is required.") , 
+    [string]$Destination ,      
+    [int]$RententionDays , 
+        [string]$LogDir 
+) 
+
+# Force a minimum of two days of retention 
+if ($RetentionDays -lt 2 ) { $RetentionDays = 2 } 
+
+#[string]$ServerInstance = "AD1HFDSQLX051" 
+#[int]$CleanupHoursToKeep = -48 
+
+[System.Reflection.Assembly]::LoadWithPartialName("Microsoft.AnalysisServices") > $null 
+[Microsoft.AnalysisServices.Server]$svr = new-Object([Microsoft.AnalysisServices.Server]) 
+[Microsoft.AnalysisServices.BackupInfo]$svrbk = new-Object([Microsoft.AnalysisServices.BackupInfo]) 
+[Microsoft.AnalysisServices.BackupInfo]$bkloc = New-Object ([Microsoft.AnalysisServices.BackupInfo]) 
+
+$svr.Connect($ServerInstance) 
+
+if ($Destination -eq "") { 
+  Write-Host Setting the Destination parameter to the BackupDir parameter 
+  $Destination = $svr.ServerProperties.Item("BackupDir").Value 
+} 
+if (! (test-path $Destination)) { 
+  Write-Host Destination path `"$Destination`" does not exists.  Exiting script. 
+  exit 1 
+} else { 
+  Write-Host Backup files will be written to `"$Destination`" 
+} 
+
+if ($LogDir -eq "") { 
+  Write-Host Setting the Log directory parameter to the LogDir parameter 
+  $LogDir = $svr.ServerProperties.Item("LogDir").Value 
+} 
+if (! (test-path $LogDir)) { 
+  Write-Host Log directory `"$LogDir`" does not exists.  Exiting script. 
+  exit 1 
+} else { 
+  Write-host Logs will be written to $LogDir 
+} 
+if (-not $LogDir.EndsWith("\")) {$LogDir += "\"} 
+if (-not $Destination.EndsWith("\")) {$Destination += "\"} 
+[string]$LogFile=$LogDir + "SSASBackup." + $ServerInstance.Replace("\","_") + ".log" 
+
+$dbs = $svr.Databases 
+$bkloc.AllowOverwrite = 1 
+$bkloc.ApplyCompression = 1 
+$bkloc.BackupRemotePartitions = 1 
+
+[string]$BackupTimeStamp = Get-Date  -Format "yyyy-MM-ddTHHmm" 
+
+"Backing up files on $ServerInstance at $BackupTimeStamp" | Out-File -filepath $LogFile -encoding oem -append 
+# Back up the SSAS databases 
+foreach ($db in $dbs) { 
+  $bkloc.file = $Destination + $db.name + "." + $BackupTimeStamp + ".abf" 
+  Write-Host Backing up $db.Name to $bkloc.File 
+  $db.Backup($bkloc) 
+  if ($?) { 
+    "Successfully backed up " + $db.Name + " to " + $bkloc.File | Out-File -filepath $LogFile -encoding oem -append 
+  } else { 
+    "FAILED to back up " + $db.Name + " to " + $bkloc.File | Out-File -filepath $LogFile -encoding oem -append 
+  } 
+} 
+
+$svr.Disconnect() 
+
+# Clear out the old files 
+Write-Host Clearing out old files from $Destination 
+[int]$RetentionHours = $RetentionDays * 24 * -1 
+"Deleting old backup files" | Out-File -filepath $LogFile -encoding oem -append 
+get-childitem ($Destination + "*.abf") | where-object {$_.LastWriteTime -le [System.DateTime]::Now.AddHours($RetentionHours)} | Out-File -filepath $LogFile -encoding oem -append 
+
+get-childitem ($Destination + "*.abf") | where-object {$_.LastWriteTime -le [System.DateTime]::Now.AddHours($RetentionHours)} | remove-item 
+
+
+
+

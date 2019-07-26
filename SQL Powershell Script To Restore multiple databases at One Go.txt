@@ -1,0 +1,235 @@
+--SQL Powershell Script To Restore multiple databases at One Go
+
+http://www.sqlservercentral.com/scripts/powershell/101648/
+
+ By Raushan, 2013/09/06
+
+#  This script is used ONLY in test/development environments!
+#  If you are planning to use this to restore production databases you should first test and evaluate the script in a test environment.
+#  You can change the script if needed to match your environment and needs.
+ 
+# Script will restore all the databases (*.bak) which are located in the folder defined as parameter.
+# It will place database files to location defined for data and log files in SQL Server instance settings
+
+# Steps to run this script:
+
+1)First Save the script in file "D:\PSScriptToRestoreDatabases.PS1" -- you can save it at any location and write the command accordingly.
+2)Open Run-->sqlps
+3)write below commands .. Specify the BackupFileLocation and SQLServerInstance in this command
+   D:\PSScriptToRestoreDatabases.PS1 -BackupFileLocation [bak_file_location] -SqlServerName [SQL Server Instance]
+
+Parameters:
+   -BackupFileLocation parameter is the full path to the folder where the BAK files are located
+   -SqlServerName parameter is the SQL Server instance name where to restore
+
+#  Example:
+#  D:\PSScriptToRestoreDatabases.PS1   -BackupFileLocation "D:\SQLBackups" -SqlServerName "DEFAULT"
+#  D:\PSScriptToRestoreDatabases.PS1   –BackupFileLocation “D:\DBBackups” –SqlServerName “.\SQL2008R2”
+#  D:\PSScriptToRestoreDatabases.PS1   –BackupFileLocation “D:\DBBackups” –SqlServerName “.\SQL2012”
+
+You will get the results like below ... 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+Param (
+	[string]$BackupFileLocation,
+	[string]$SqlServerName
+)
+
+	$server = New-Object ("Microsoft.SqlServer.Management.Smo.Server") $SqlServerName
+	$DatabaseDefaultPath= $server.MasterDBPath +"\"
+ 
+	$bakFiles = Get-ChildItem $BackupFileLocation -Filter "*.bak"
+
+	### BOS Get the Default File Locations ###
+	 
+	$DefaultSystemDataLocation = $Server.Information.MasterDBPath 
+	$DefaultSystemLogLocation = $Server.Information.MasterDBLogPath 
+	
+	$DefaultUserDBDataLocation = $Server.Settings.DefaultFile
+	$DefaultUserDBLogLocation  = $Server.Settings.DefaultLog
+
+ 
+	if ($DefaultUserDBDataLocation.Length -eq 0) 
+	    { 
+	        $DefaultUserDBDataLocation = $DefaultSystemDataLocation
+	    }	
+	if ($DefaultUserDBLogLocation.Length -eq 0) 
+	    { 
+	        $DefaultUserDBLogLocation = $DefaultSystemLogLocation 
+	    }
+
+	### EOS Get the Default File Locations ###
+
+
+###### BEGIN OF FOR LOOP ##############################################################################
+
+	foreach ($bak in $bakFiles)
+	{
+
+		$RestoreHeaderOnlyQuery="Restore HeaderOnly From Disk=N'"+$bak.FullName+"'"
+		$HeaderData=INVOKE-SQLCMD -SERVERINSTANCE $server -QUERY $RestoreHeaderOnlyQuery
+		
+		$FileNumber=0
+
+		foreach ($HData in $HeaderData)
+		{
+		  If($HData.BackupType -eq 1)
+			{
+			 $FileNumber=$HData.Position
+			 $DBName=$HData.DatabaseName
+			 $BackupOfServer= "["+$HData.ServerName+"]"
+			}
+		}		
+
+	  if ($FileNumber -ne 0)
+          {
+
+		IF($DBName -eq "master" -OR $DBName -eq "model" -OR $DBName -eq "msdb")
+		{
+			$DefaultDataLocation=$DefaultSystemDataLocation+ "\"
+			$DefaultLogLocation=$DefaultSystemLogLocation+ "\"
+		}
+		else
+		{
+			$DefaultDataLocation=$DefaultUserDBDataLocation+ "\"
+			$DefaultLogLocation=$DefaultUserDBLogLocation+ "\"
+		}
+
+
+		$db = $server.Databases[$DBName]
+
+		write-host "-------------------------------------------------------------"
+		write-host "Restoring database [$($dbName)] On Server $($server)" -ForegroundColor Green
+		write-host "-------------------------------------------------------------"
+
+		$RestoreFileListQuery="Restore FilelistOnly From Disk=N'"+$bak.FullName+"'"
+		$FileListData=INVOKE-SQLCMD -SERVERINSTANCE $server -QUERY $RestoreFileListQuery
+		$MoveQuery=""
+
+		foreach ($FData in $FileListData)
+		{
+
+			$PhName=$FData.PhysicalName
+			$str= $PhName.SubString(0,$PhName.LastIndexOf("\")+1)
+			$PhName=$PhName -replace "\\","_"
+			$str=$str -replace "\\","_"
+			$LogicalFilename=  $PhName -replace $str,""
+			 
+			IF($FData.Type -eq "D")
+			{ 
+			$MoveQuery=$MoveQuery+
+			"MOVE N'"+$FData.LogicalName+"'"+
+			"TO N'"+$DefaultDataLocation+ $LogicalFilename+"',"
+			}
+
+			IF($FData.Type -eq "L")
+			{ 
+			$MoveQuery=$MoveQuery+
+			"MOVE N'"+$FData.LogicalName+"'"+
+			"TO N'"+$DefaultLogLocation+ $LogicalFilename+"',"
+			}
+		}
+
+		$RestoreQuery= "Restore Database "+ $DBName +
+			" FROM DISK=N'"+$bak.FullName+"' "+
+			"WITH REPLACE,FILE = "+ $FileNumber+","+
+		 	$MoveQuery +
+			"NOUNLOAD, STATS = 20"
+
+		if ($DBName -eq "master")
+            	{  
+		
+		   if($BackupOfServer -eq $server)
+		    {
+			$QrForInstance="select isnull('mssql?'+cast(SERVERPROPERTY('instancename') as varchar(50)),'mssqlserver') as InstanceName"
+			$Instance=INVOKE-SQLCMD -SERVERINSTANCE $server -QUERY $QrForInstance -VERBOSE
+			$ServiceName=$Instance.InstanceName
+			$DisplayName= Get-Service -name $ServiceName | select DisplayName
+			$Command="net start `""+$DisplayName.DisplayName+"`" /m"
+
+			If($ServiceName -like "*sql*" -and $DisplayName -like "*sql*")
+	
+			{
+			
+				#Stop Service
+				stop-service $ServiceName -force -verbose
+	
+				#Start Service in Single User Mode
+				invoke-EXPRESSION $Command -verbose
+	
+				#Restoring Master Database
+				write-host "********************"
+				INVOKE-SQLCMD -SERVERINSTANCE $server -QUERY $RestoreQuery -querytimeout 65534 -VERBOSE
+				write-host "********************"
+				write-host ""
+			
+				#Stop Service
+				stop-service $ServiceName -force -verbose  
+
+				#Start Service
+				start-service $ServiceName  -verbose 
+
+			}
+		    } 
+		    else
+		    {
+			write-host "You are restoring The backup of master database of server $($BackupOfServer) to Server $($server), which is not compatiable." -ForegroundColor Red 
+			write-host "Please restore valid backup." -ForegroundColor Red
+			
+		    }
+         	             	
+            	}
+		else
+		{	
+			if ($db -ne $null)
+            		{
+                	$server.KillAllProcesses($dbName)                	
+            		}
+
+			INVOKE-SQLCMD -SERVERINSTANCE $server -QUERY $RestoreQuery -querytimeout 65534 -VERBOSE
+		}		
+
+		
+
+		write-host "-------------------------------------------------------------"
+		write-host ""		
+                	
+            }
+	    ELSE
+	    {
+		write-host "-----------------------------------------------------------------------------------------------------------"
+                write-host "Backup file $($bak.FullName) does not contain any FULL database backup(s)" -ForegroundColor Red
+		write-host "-----------------------------------------------------------------------------------------------------------"
+		write-host ""
+			
+            }
+    	Start-Sleep -Seconds 3 
+          
+	}
+
+###### END OF FOR LOOP ##############################################################################
+
+write-host ""
+
+
+
+
